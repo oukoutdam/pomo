@@ -1,0 +1,17 @@
+# Build output
+/bin/
+/pomo
+*.test
+
+# Test coverage and profiling output
+/coverage.out
+/coverage.html
+*.prof
+
+# Local session data and SQLite sidecar files
+*.sqlite3
+*.sqlite3-*
+timer.lock
+
+# macOS metadata
+.DS_Store
