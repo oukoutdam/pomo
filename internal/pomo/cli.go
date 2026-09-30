@@ -4,7 +4,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"time"
 
@@ -30,6 +29,7 @@ Timer keys:
   p / Space        Pause or resume
   e                Extend finished focus into a stopwatch
   b                Save focus and start a break, including during extension
+  f                End a break and start focus, including while paused
   Enter            Start break after focus, or focus after a finished break
   q / Ctrl+C       Save and quit
 
@@ -56,7 +56,7 @@ func Run(args []string, in, out, errOut *os.File) error {
 	if len(args) > 0 {
 		switch args[0] {
 		case "help", "--help", "-h":
-			fmt.Fprint(out, usage)
+			printHelp(out)
 			return nil
 		case "--version", "version":
 			fmt.Fprintln(out, "pomo 0.1.0")
@@ -71,7 +71,7 @@ func Run(args []string, in, out, errOut *os.File) error {
 	}
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(errOut)
-	fs.Usage = func() { fmt.Fprint(errOut, usage) }
+	fs.Usage = func() { printHelp(errOut) }
 	var duration string
 	var year int
 	var show bool
@@ -121,14 +121,7 @@ func Run(args []string, in, out, errOut *os.File) error {
 		if err != nil {
 			return err
 		}
-		PrintTotals(out, report)
-		width := terminalWidth(out)
-		_, noColor := os.LookupEnv("NO_COLOR")
-		color := term.IsTerminal(int(out.Fd())) && !noColor && os.Getenv("TERM") != "dumb"
-		PrintCalendar(out, report, now, year, width, color)
-		if report.Total == 0 {
-			fmt.Fprintln(out, "\nYour first focus starts the map. Run: pomo")
-		}
+		PrintStats(out, report, now, year)
 		return nil
 	}
 	if !term.IsTerminal(int(in.Fd())) || !term.IsTerminal(int(out.Fd())) || os.Getenv("TERM") == "dumb" {
@@ -167,11 +160,4 @@ func terminalWidth(out *os.File) int {
 		return 80
 	}
 	return width
-}
-
-// A tiny helper also used by the live screen, where raw mode requires CRLF.
-func writeLines(w io.Writer, lines ...string) {
-	for _, line := range lines {
-		fmt.Fprintf(w, "%s\r\n", line)
-	}
 }

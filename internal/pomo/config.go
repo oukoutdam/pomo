@@ -104,13 +104,14 @@ func SaveConfig(dir string, c Config) error {
 }
 
 func ShowConfig(w io.Writer, dir string, c Config) {
-	fmt.Fprintf(w, "Focus: %s\nShort break: %s\nLong break: %s\nLong break every: %d completed focus sessions (0 = disabled)\nSound: %t\nConfig: %s\nHistory: %s\n", c.Focus, c.Break, c.LongBreak, c.LongEvery, c.Sound, filepath.Join(dir, "config.json"), filepath.Join(dir, "history.sqlite3"))
+	printWrapped(w, fmt.Sprintf("Focus: %s\nShort break: %s\nLong break: %s\nLong break every: %d completed focus sessions (0 = disabled)\nSound: %t\nConfig: %s\nHistory: %s", c.Focus, c.Break, c.LongBreak, c.LongEvery, c.Sound, filepath.Join(dir, "config.json"), filepath.Join(dir, "history.sqlite3")))
 }
 
 func Configure(r io.Reader, w io.Writer, dir string, current Config) error {
 	scanner := bufio.NewScanner(r)
 	ask := func(label, fallback string) (string, error) {
-		fmt.Fprintf(w, "%s [%s]: ", label, fallback)
+		prompt := staticStyles(w).heading.Render(label) + " [" + fallback + "]: "
+		fmt.Fprint(w, strings.Join(wrapWords(prompt, outputWidth(w)), "\n"))
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				return "", err
@@ -123,7 +124,7 @@ func Configure(r io.Reader, w io.Writer, dir string, current Config) error {
 		}
 		return answer, nil
 	}
-	fmt.Fprintln(w, "Choose your rhythm\n  1  Classic    25 / 5 / 15 minutes, long break every 4\n  2  Deep work  50 / 10 / 20 minutes, long break every 4\n  3  Custom    choose each duration and break frequency")
+	printWrapped(w, staticStyles(w).heading.Render("Choose your rhythm")+"\n  1  Classic    25 / 5 / 15 minutes, long break every 4\n  2  Deep work  50 / 10 / 20 minutes, long break every 4\n  3  Custom    choose each duration and break frequency")
 	c := current
 	for {
 		choice, err := ask("Preset (1, 2, or 3)", "3")
@@ -202,7 +203,7 @@ func Configure(r io.Reader, w io.Writer, dir string, current Config) error {
 	if err := SaveConfig(dir, c); err != nil {
 		return err
 	}
-	fmt.Fprintln(w, "\nSaved your rhythm.")
+	printWrapped(w, "\n"+staticStyles(w).heading.Render("Saved your rhythm."))
 	ShowConfig(w, dir, c)
 	return nil
 }

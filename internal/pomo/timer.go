@@ -2,6 +2,7 @@ package pomo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,353 +11,305 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/term"
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 )
 
-type Controller struct {
-	Engine    *Engine
-	Store     *Store
-	Config    Config
-	Completed int
-	LongBreak bool
+type timerTick struct{}
+type timerQuit struct{}
+type notificationResult struct{ err error }
+
+// Bubble Tea v2.0.0 ignores EOF. Preserve the file interface (and therefore
+// cancellable reads and raw mode), but make closure end the program.
+var errInputClosed = errors.New("timer input closed")
+
+type timerInput struct{ *os.File }
+
+func (in timerInput) Read(p []byte) (int, error) {
+	n, err := in.File.Read(p)
+	if errors.Is(err, io.EOF) {
+		err = errInputClosed
+	}
+	return n, err
 }
 
-func NewController(store *Store, config Config, kind string, duration time.Duration, now time.Time) (*Controller, error) {
-	c := &Controller{Engine: NewEngine(kind, duration, now), Store: store, Config: config}
-	return c, store.Save(&c.Engine.Session)
+// The sole worker sends notifications in order. Its bounded queue never blocks
+// Update, and cancellation interrupts outstanding desktop commands on shutdown.
+type notificationWorker struct {
+	events  chan Notification
+	results chan notificationResult
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
-func (c *Controller) Advance(now time.Time) (bool, bool) {
-	completed, slept := c.Engine.Advance(now)
-	if completed && c.Engine.Session.Kind == "focus" {
-		c.Completed++
-	}
-	return completed, slept
-}
-
-func (c *Controller) Save() error { return c.Store.Save(&c.Engine.Session) }
-
-func (c *Controller) Stop() error {
-	c.Engine.Finish()
-	return c.Save()
-}
-
-func (c *Controller) StartBreak(now time.Time) error {
-	if c.Engine.Session.Kind != "focus" {
-		return nil
-	}
-	duration, long := nextBreak(c.Config, c.Completed, c.Engine.Session.Completed)
-	if err := c.Stop(); err != nil {
-		return err
-	}
-	c.Engine = NewEngine("break", duration, now)
-	c.LongBreak = long
-	return c.Save()
-}
-
-func (c *Controller) StartFocus(now time.Time) error {
-	if c.Engine.Session.Kind != "break" || c.Engine.Session.State != "waiting" {
-		return nil
-	}
-	if err := c.Stop(); err != nil {
-		return err
-	}
-	duration, _ := parseDuration(c.Config.Focus)
-	c.Engine = NewEngine("focus", duration, now)
-	c.LongBreak = false
-	return c.Save()
-}
-
-func RunTimer(in, out *os.File, store *Store, config Config, kind string, duration time.Duration, quiet, noNotify bool, notifier Notifier) error {
-	state, err := term.MakeRaw(int(in.Fd()))
-	if err != nil {
-		return err
-	}
-	restored := false
-	restore := func() {
-		if restored {
-			return
-		}
-		fmt.Fprint(out, "\x1b[?25h\x1b[?1049l")
-		term.Restore(int(in.Fd()), state)
-		restored = true
-	}
-	defer restore()
-	fmt.Fprint(out, "\x1b[?1049h\x1b[?25l")
-	err = interactiveTimer(in, out, store, config, kind, duration, quiet, noNotify, notifier)
-	restore()
-	if err != nil {
-		return err
-	}
-	report, err := readReport(store, time.Now())
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "Focus saved. Today: %s | All time: %s\nSee your map: pomo stats\nStart a break any time: pomo break\n", formatHours(report.Today), formatHours(report.Total))
-	return nil
-}
-
-func interactiveTimer(in, out *os.File, store *Store, config Config, kind string, duration time.Duration, quiet, noNotify bool, notifier Notifier) error {
-	c, err := NewController(store, config, kind, duration, time.Now())
-	if err != nil {
-		return err
-	}
-	keys := make(chan byte, 16)
-	inputErrors := make(chan error, 1)
-	inputDone := make(chan struct{})
-	defer close(inputDone)
+func startNotificationWorker(notifier Notifier) *notificationWorker {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &notificationWorker{make(chan Notification, 4), make(chan notificationResult, 4), ctx, cancel, make(chan struct{})}
 	go func() {
-		buffer := make([]byte, 1)
+		defer close(w.done)
 		for {
-			n, err := in.Read(buffer)
-			if err != nil {
-				inputErrors <- err
+			select {
+			case <-ctx.Done():
 				return
-			}
-			if n > 0 {
+			case event := <-w.events:
+				if ctx.Err() != nil {
+					return
+				}
+				err := notifier.Send(ctx, event)
 				select {
-				case keys <- buffer[0]:
-				case <-inputDone:
+				case w.results <- notificationResult{err}:
+				case <-ctx.Done():
 					return
 				}
 			}
 		}
 	}()
+	return w
+}
+func (w *notificationWorker) stop() { w.cancel(); <-w.done }
+func (w *notificationWorker) listen() tea.Msg {
+	select {
+	case result := <-w.results:
+		return result
+	case <-w.ctx.Done():
+		return nil
+	}
+}
+
+type timerModel struct {
+	controller       *Controller
+	report           Report
+	worker           *notificationWorker
+	now              func() time.Time
+	lastSave         time.Time
+	width, height    int
+	color, dark      bool
+	silent, noNotify bool
+	notice, warning  string
+	err              error
+	stopped, pasting bool
+}
+
+func newTimerModel(c *Controller, worker *notificationWorker, quiet, noNotify, color bool, now time.Time) (*timerModel, error) {
+	report, err := readReport(c.Store, now)
+	if err != nil {
+		return nil, err
+	}
+	notice := "Your time counts, including sessions you stop early."
+	if c.Engine.Session.Kind == "break" {
+		notice = "Rest time is not counted as focus."
+	}
+	return &timerModel{controller: c, worker: worker, report: report, now: time.Now,
+		lastSave: now, width: 80, height: 24, color: color, dark: true,
+		silent: quiet || !c.Config.Sound, noNotify: noNotify, notice: notice}, nil
+}
+func nextTimerTick() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg { return timerTick{} })
+}
+func (m *timerModel) Init() tea.Cmd {
+	commands := []tea.Cmd{nextTimerTick(), m.worker.listen}
+	if m.color {
+		commands = append(commands, tea.RequestBackgroundColor)
+	}
+	return tea.Batch(commands...)
+}
+func (m *timerModel) checkpoint(now time.Time) error {
+	if err := m.controller.Save(); err != nil {
+		return err
+	}
+	report, err := readReport(m.controller.Store, now)
+	if err != nil {
+		return err
+	}
+	m.report, m.lastSave = report, now
+	return nil
+}
+func (m *timerModel) stop(err error) tea.Cmd {
+	if !m.stopped {
+		m.err = errors.Join(m.err, err, m.controller.Stop())
+		m.stopped = true
+	}
+	return tea.Quit
+}
+func (m *timerModel) completionNotification() {
+	s := m.controller.Engine.Session
+	title := "Focus complete"
+	message := fmt.Sprintf("%s focused. Today: %s. Extend, take a break, or stop in pomo.", formatHours(s.Elapsed()), formatHours(m.report.Today))
+	if s.Kind == "break" {
+		title = "Break complete"
+		message = fmt.Sprintf("Ready for another focus? Today: %s. Return to pomo when ready.", formatHours(m.report.Today))
+	}
+	select {
+	case m.worker.events <- Notification{Title: "pomo - " + title, Message: message, Sound: !m.silent, Banner: !m.noNotify}:
+	default:
+		m.warning = "Notification queue busy; timer completion is saved."
+	}
+}
+func (m *timerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.stopped {
+		return m, nil
+	}
+	var next tea.Cmd
+	key := ""
+	quitting := false
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+	case tea.BackgroundColorMsg:
+		m.dark = msg.IsDark()
+		return m, nil
+	case tea.PasteStartMsg:
+		m.pasting = true
+		return m, nil
+	case tea.PasteEndMsg:
+		m.pasting = false
+		return m, nil
+	case tea.PasteMsg:
+		return m, nil
+	case tea.KeyPressMsg:
+		if m.pasting {
+			return m, nil
+		}
+		key = strings.ToLower(msg.String())
+		quitting = key == "q" || key == "ctrl+c" || key == "ctrl+d"
+	case timerQuit:
+		quitting = true
+	case timerTick:
+		next = nextTimerTick()
+	case notificationResult:
+		if msg.err != nil {
+			m.warning = "Notification unavailable; completion is saved. " + msg.err.Error()
+		}
+		return m, m.worker.listen
+	default:
+		return m, nil
+	}
+	// Use processing time, never the timestamp of a queued tick. This preserves
+	// sleep detection even when a checkpoint or the event loop is delayed.
+	now := m.now()
+	c := m.controller
+	completed, slept := c.Advance(now)
+	changed := completed || slept
+	if slept {
+		m.warning = "Clock gap detected. Paused; press p to resume."
+	}
+	if completed {
+		if err := m.checkpoint(now); err != nil {
+			return m, m.stop(err)
+		}
+		m.notice = "No time is counted while you choose what comes next."
+		m.completionNotification()
+	}
+	if quitting {
+		return m, m.stop(nil)
+	}
+	before := c.Engine.Session.State
+	switch key {
+	case "p", "space", " ":
+		c.Engine.TogglePause(now)
+		if before != c.Engine.Session.State {
+			changed = true
+			if slept || strings.HasPrefix(m.warning, "Clock gap detected.") {
+				m.warning = ""
+			}
+			m.notice = "Timer resumed."
+			if c.Engine.Session.State == "paused" {
+				m.notice = "Paused. Take your time; press p to resume."
+			}
+		}
+	case "e":
+		if c.Engine.Extend(now) {
+			changed = true
+			m.notice = "Extension counts as focus. Start a break whenever you are ready."
+		}
+	case "b", "f", "enter":
+		if c.Engine.Session.Kind == "focus" && (key == "b" || key == "enter" && before == "waiting") {
+			if err := c.StartBreak(now); err != nil {
+				return m, m.stop(err)
+			}
+			changed = true
+			m.notice = "Focus saved. Enjoy your break."
+		} else if c.Engine.Session.Kind == "break" && (key == "f" || key == "enter" && before == "waiting") {
+			if err := c.StartFocus(now); err != nil {
+				return m, m.stop(err)
+			}
+			changed = true
+			m.notice = "A fresh focus. One session at a time."
+		}
+	}
+	if c.Engine.Session.State != "paused" && strings.HasPrefix(m.warning, "Clock gap detected.") {
+		m.warning = ""
+	}
+	if changed || now.Sub(m.lastSave) >= time.Second {
+		if err := m.checkpoint(now); err != nil {
+			return m, m.stop(err)
+		}
+	}
+	return m, next
+}
+func (m *timerModel) View() tea.View {
+	v := tea.NewView(timerView(m.controller.Engine.Session, m.controller.LongBreak, m.report,
+		m.notice, m.warning, m.width, m.height, m.silent, m.noNotify, newStyles(m.color, m.dark)))
+	v.AltScreen = true
+	return v
+}
+
+func RunTimer(in, out *os.File, store *Store, config Config, kind string, duration time.Duration, quiet, noNotify bool, notifier Notifier) error {
+	// Register before starting the session. Bubble Tea's competing SIGINT/SIGTERM
+	// handler is disabled; resize handling remains owned by Bubble Tea.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(signals)
-	events := make(chan Notification, 4)
-	noticeErrors := make(chan error, 8)
-	noticeDone := make(chan struct{})
+	now := time.Now()
+	c, err := NewController(store, config, kind, duration, now)
+	if err != nil {
+		return err
+	}
+	worker := startNotificationWorker(notifier)
+	defer worker.stop()
+	m, err := newTimerModel(c, worker, quiet, noNotify, colorEnabled(out), now)
+	if err != nil {
+		return errors.Join(err, c.Stop())
+	}
+	options := []tea.ProgramOption{tea.WithInput(timerInput{in}), tea.WithOutput(out), tea.WithoutSignalHandler()}
+	if !m.color {
+		options = append(options, tea.WithColorProfile(colorprofile.NoTTY))
+	}
+	program := tea.NewProgram(m, options...)
+	bridgeDone := make(chan struct{})
+	bridgeStopped := make(chan struct{})
 	go func() {
-		defer close(noticeDone)
-		for event := range events {
-			if err := notifier.Send(context.Background(), event); err != nil {
-				select {
-				case noticeErrors <- err:
-				default:
-				}
-			}
+		defer close(bridgeStopped)
+		select {
+		case <-signals:
+			program.Send(timerQuit{})
+		case <-bridgeDone:
 		}
 	}()
-	defer func() { close(events); <-noticeDone }()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	lastSave := time.Now()
-	lastDraw := time.Time{}
-	lastScreen := ""
+	_, runErr := program.Run()
+	close(bridgeDone)
+	<-bridgeStopped
+	worker.cancel()
+	// Run has restored the terminal and stopped Update. Input closure, startup
+	// failures, and renderer errors also get a final checkpoint without races.
+	if !m.stopped {
+		c.Advance(time.Now())
+		m.stop(nil)
+	}
+	if errors.Is(runErr, errInputClosed) {
+		runErr = nil
+	}
+	if err := errors.Join(runErr, m.err); err != nil {
+		return err
+	}
 	report, err := readReport(store, time.Now())
 	if err != nil {
 		return err
 	}
-	notice := "Your time counts, including sessions you stop early."
-	if kind == "break" {
-		notice = "Rest time is not counted as focus."
-	}
-	for {
-		var key byte
-		quit := false
-		select {
-		case key = <-keys:
-		case <-ticker.C:
-		case <-signals:
-			quit = true
-		case inputErr := <-inputErrors:
-			if err := c.Stop(); err != nil {
-				return err
-			}
-			if inputErr == io.EOF {
-				return nil
-			}
-			return inputErr
-		case noticeErr := <-noticeErrors:
-			notice = "Notification unavailable; focus is saved. " + noticeErr.Error()
-		}
-		now := time.Now()
-		completed, slept := c.Advance(now)
-		if slept {
-			notice = "Clock gap detected. Paused; press p to resume."
-		}
-		changed := key != 0 || completed || slept
-		if completed {
-			notice = "No time is counted while you choose what comes next."
-			// Commit completion before any external notification operation.
-			if err := c.Save(); err != nil {
-				return err
-			}
-			report, err = readReport(store, now)
-			if err != nil {
-				return err
-			}
-			title := "Focus complete"
-			message := fmt.Sprintf("%s focused. Today: %s. Extend, take a break, or stop in pomo.", formatHours(c.Engine.Session.Elapsed()), formatHours(report.Today))
-			if c.Engine.Session.Kind == "break" {
-				title = "Break complete"
-				message = fmt.Sprintf("Ready for another focus? Today: %s. Return to pomo when ready.", formatHours(report.Today))
-			}
-			select {
-			case events <- Notification{Title: "pomo - " + title, Message: message, Sound: config.Sound && !quiet, Banner: !noNotify}:
-			default:
-				notice = "Notification queue busy; timer completion is saved."
-			}
-		}
-		if key == 'q' || key == 'Q' || key == 3 || key == 4 || quit {
-			return c.Stop()
-		}
-		switch key {
-		case 'p', 'P', ' ':
-			c.Engine.TogglePause(now)
-			if c.Engine.Session.State == "paused" {
-				notice = "Paused. Take your time; press p to resume."
-			} else if c.Engine.Session.State != "waiting" {
-				notice = "Timer resumed."
-			}
-		case 'e', 'E':
-			if c.Engine.Extend(now) {
-				notice = "Extension counts as focus. Start a break whenever you are ready."
-			}
-		case 'b', 'B':
-			if c.Engine.Session.Kind == "focus" {
-				if err := c.StartBreak(now); err != nil {
-					return err
-				}
-				notice = "Focus saved. Enjoy your break."
-			}
-		case '\r', '\n':
-			if c.Engine.Session.State == "waiting" {
-				if c.Engine.Session.Kind == "focus" {
-					err = c.StartBreak(now)
-					notice = "Focus saved. Enjoy your break."
-				} else {
-					err = c.StartFocus(now)
-					notice = "A fresh focus. One session at a time."
-				}
-				if err != nil {
-					return err
-				}
-			}
-		}
-		if changed || now.Sub(lastSave) >= time.Second {
-			if changed || c.Engine.Session.State == "countdown" || c.Engine.Session.State == "overtime" {
-				if err := c.Save(); err != nil {
-					return err
-				}
-			}
-			report, err = readReport(store, now)
-			if err != nil {
-				return err
-			}
-			lastSave = now
-		}
-		if changed || now.Sub(lastDraw) >= time.Second {
-			var screen strings.Builder
-			renderTimer(&screen, c, report, notice, terminalWidth(out), quiet || !config.Sound, noNotify)
-			if screen.String() != lastScreen {
-				fmt.Fprint(out, screen.String())
-				lastScreen = screen.String()
-			}
-			lastDraw = now
-		}
-	}
-}
-
-func clockText(d time.Duration) string {
-	if d < 0 {
-		d = 0
-	}
-	seconds := int((d + time.Second - 1) / time.Second)
-	if seconds >= 3600 {
-		return fmt.Sprintf("%02d:%02d:%02d", seconds/3600, seconds/60%60, seconds%60)
-	}
-	return fmt.Sprintf("%02d:%02d", seconds/60, seconds%60)
-}
-
-func renderTimer(out io.Writer, c *Controller, report Report, notice string, width int, silent, noNotify bool) {
-	s := c.Engine.Session
-	elapsed := s.Elapsed()
-	label := "FOCUS"
-	if s.Kind == "break" {
-		label = "BREAK"
-		if c.LongBreak {
-			label = "LONG BREAK"
-		}
-	}
-	status := s.State
-	if s.State == "waiting" {
-		status = "complete - waiting for you"
-	}
-	fmt.Fprint(out, "\x1b[H\x1b[2J")
-	writeLines(out, "", "  pomo / "+label, "  "+status, "")
-	display := clockText(s.Planned - elapsed)
-	if s.State == "overtime" || (s.State == "paused" && s.Completed) {
-		display = "+" + clockText(elapsed-s.Planned) + " extended"
-	}
-	if s.State == "waiting" {
-		display = "Done. Take a breath."
-	}
-	writeLines(out, "  "+display, "")
-	barWidth := width - 6
-	if barWidth > 36 {
-		barWidth = 36
-	}
-	if barWidth < 4 {
-		barWidth = 4
-	}
-	filled := int(float64(elapsed) / float64(s.Planned) * float64(barWidth))
-	if filled > barWidth {
-		filled = barWidth
-	}
-	writeLines(out, "  ["+strings.Repeat("#", filled)+strings.Repeat("-", barWidth-filled)+"]", "")
-	if s.Kind == "focus" {
-		writeLines(out, "  This focus: "+formatHours(elapsed))
-	}
-	writeLines(out, "  Today: "+formatHours(report.Today), "  This week: "+formatHours(report.Week), "")
-	if s.State == "waiting" {
-		if s.Kind == "focus" {
-			writeLines(out, "  e  Extend focus (stopwatch)", "  b / Enter  Start break", "  q  Stop and save")
-		} else {
-			writeLines(out, "  Enter  Start focus", "  q  Stop")
-		}
-	} else {
-		writeLines(out, "  p / Space  Pause or resume")
-		if s.Kind == "focus" {
-			writeLines(out, "  b  Stop focus and start break")
-		}
-		writeLines(out, "  q / Ctrl+C  Save and quit")
-	}
-	writeLines(out, "", fmt.Sprintf("  Sound: %s | Notifications: %s", onOff(!silent), onOff(!noNotify)), "")
-	// Wrap the informational line so common 80-column terminals do not scroll.
-	lineWidth := width - 4
-	if lineWidth < 10 {
-		lineWidth = 10
-	}
-	for _, line := range wrapWords(notice, lineWidth) {
-		writeLines(out, "  "+line)
-	}
-}
-
-func onOff(value bool) string {
-	if value {
-		return "on"
-	}
-	return "off"
-}
-
-func wrapWords(s string, width int) []string {
-	var lines []string
-	line := ""
-	for _, word := range strings.Fields(s) {
-		if len(line)+1+len(word) > width && line != "" {
-			lines = append(lines, line)
-			line = ""
-		}
-		if line != "" {
-			line += " "
-		}
-		line += word
-	}
-	if line != "" {
-		lines = append(lines, line)
-	}
-	return lines
+	styles := staticStyles(out)
+	printWrapped(out, styles.heading.Render("Focus saved.")+" Today: "+formatHours(report.Today)+" | All time: "+formatHours(report.Total))
+	printWrapped(out, "See your map: pomo stats\nStart a break any time: pomo break")
+	return nil
 }

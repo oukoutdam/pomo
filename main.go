@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"pomo/internal/pomo"
+	"github.com/oukoutdam/pomo/internal/pomo"
 )
 
 func main() {

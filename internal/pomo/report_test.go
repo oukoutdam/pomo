@@ -2,6 +2,10 @@ package pomo
 
 import (
 	"bytes"
+	"fmt"
+	"regexp"
+
+	"github.com/charmbracelet/x/ansi"
 	"strings"
 	"testing"
 	"time"
@@ -79,20 +83,11 @@ func TestCalendarNarrowMonochromeAndLeapDay(t *testing.T) {
 	if !strings.Contains(output, "3 ") || strings.Count(output, "Mon ") < 3 {
 		t.Fatal("missing leap day or narrow panels")
 	}
-	// All 366 in-range days must be represented exactly once.
-	cells := 0
-	for _, line := range strings.Split(output, "\n") {
-		if len(line) >= 6 && strings.Contains("Mon Tue Wed Thu Fri Sat Sun", strings.TrimSpace(line[:6])) {
-			for _, char := range line[6:] {
-				if strings.ContainsRune(".1234", char) {
-					cells++
-				}
-			}
-			if len(line) > 40 {
-				t.Fatal("calendar row wider than terminal")
-			}
-		}
-	}
+	// All 366 in-range days must be represented exactly once, including the
+	// leap day, regardless of panel frames, indentation, or wrapping.
+	cells := countCalendarCells(output)
+	assertReportWidth(t, output, 40)
+
 	if cells != 366 {
 		t.Fatalf("calendar has %d cells, want 366", cells)
 	}
@@ -110,7 +105,7 @@ func TestCalendarEmptyAndColorLevels(t *testing.T) {
 	}
 	var b bytes.Buffer
 	PrintCalendar(&b, r, testTime(), 0, 120, true)
-	if !strings.Contains(b.String(), "\x1b[48;5;") {
+	if !strings.Contains(b.String(), "\x1b[38;5;") {
 		t.Fatal("missing color")
 	}
 	if formatHours(time.Second) != "<1m" {
@@ -123,5 +118,94 @@ func TestCalendarMonthAfterShortInitialStub(t *testing.T) {
 	PrintCalendar(&b, Report{Days: map[string]time.Duration{}}, testTime(), 0, 80, false)
 	if !strings.Contains(b.String(), "Oct") {
 		t.Fatal("short initial September stub hid October's label")
+	}
+}
+
+var calendarRow = regexp.MustCompile(`^\s*(?:│\s*)?(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (.*?)(?:\s*│)?$`)
+
+func countCalendarCells(output string) int {
+	count := 0
+	for _, line := range strings.Split(ansi.Strip(output), "\n") {
+		matches := calendarRow.FindStringSubmatch(line)
+		if len(matches) == 0 {
+			continue
+		}
+		for _, r := range matches[1] {
+			if strings.ContainsRune(".1234·■", r) {
+				count++
+			}
+		}
+	}
+	return count
+}
+func assertReportWidth(t *testing.T, output string, width int) {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		if ansi.StringWidth(line) > width {
+			t.Fatalf("line exceeds %d columns (%d): %q", width, ansi.StringWidth(line), line)
+		}
+	}
+}
+func TestStatsLayoutsPreserveHistoryAndTotals(t *testing.T) {
+	now := time.Date(2024, 12, 31, 12, 0, 0, 0, time.UTC)
+	r := Report{Days: map[string]time.Duration{"2024-02-29": 2 * time.Hour}, Today: 45 * time.Minute, Week: 5 * time.Hour, Month: 20 * time.Hour, Year: 80 * time.Hour, Total: 200 * time.Hour, Completed: 214, CurrentStreak: 5, LongestStreak: 12}
+	for _, width := range []int{20, 30, 36, 48, 80, 120} {
+		for _, color := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/color=%t", width, color), func(t *testing.T) {
+				view := statsView(r, now, 2024, width, color)
+				assertReportWidth(t, view, width)
+				if got := countCalendarCells(view); got != 366 {
+					t.Fatalf("lost days: got %d", got)
+				}
+				if !color && strings.Contains(view, "\x1b") {
+					t.Fatal("plain report contains ANSI")
+				}
+				plain := ansi.Strip(view)
+				for _, text := range []string{"Today", "This week", "This month", "This year", "All time", "0h 45m", "5h 00m", "20h 00m", "80h 00m", "200h 00m", "214 completed", "5 day streak", "12 day best"} {
+					// Very narrow reports may wrap text, but retain every value and label.
+					compact := strings.Join(strings.Fields(plain), " ")
+					if !strings.Contains(compact, text) {
+						t.Fatalf("missing %q:\n%s", text, plain)
+					}
+				}
+				if strings.Contains(plain, "╭") != (width >= 36) {
+					t.Fatal("wrong compact frame behavior")
+				}
+			})
+		}
+	}
+}
+func TestCalendarBlanksFutureDatesAndUsesOriginalBuckets(t *testing.T) {
+	now := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+	r := Report{Days: map[string]time.Duration{}}
+	for i, d := range []time.Duration{0, time.Minute, time.Hour, 2 * time.Hour, 4 * time.Hour} {
+		r.Days[fmt.Sprintf("2024-02-%02d", i+1)] = d
+	}
+	var b bytes.Buffer
+	PrintCalendar(&b, r, now, 2024, 48, false)
+	if got := countCalendarCells(b.String()); got != 61 {
+		t.Fatalf("future dates are not blank: %d", got)
+	}
+	if !strings.Contains(b.String(), "7h 01m") {
+		t.Fatal("calendar total changed")
+	}
+	for _, level := range []string{"1 ", "2 ", "3 ", "4 "} {
+		if !strings.Contains(b.String(), level) {
+			t.Fatal("missing intensity", level)
+		}
+	}
+}
+func TestStatsEmptyAndLargeTotals(t *testing.T) {
+	for _, r := range []Report{{}, {Total: 1000000 * time.Hour, Completed: 1000000, CurrentStreak: 99999, LongestStreak: 99999}} {
+		for _, width := range []int{30, 48, 80} {
+			view := statsView(r, testTime(), 0, width, false)
+			assertReportWidth(t, view, width)
+			if r.Total == 0 && !strings.Contains(strings.Join(strings.Fields(view), " "), "Your first focus starts the map.") {
+				t.Fatal("missing empty guidance")
+			}
+			if r.Total != 0 && !strings.Contains(view, "1000000h 00m") {
+				t.Fatal("large total lost")
+			}
+		}
 	}
 }
